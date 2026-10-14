@@ -1254,8 +1254,11 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
         avoided = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         break;
     case MemoryType::readback:
-        required = cpu_visible_memory_properties;
+        // The CPU reads it, so it is CPU-cached system memory where there is any: reading device-local memory
+        // through the bus is uncached and many times slower.
+        required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        avoided = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         break;
     default:
         assert(false && "create_gpu_heap received an invalid memory type");

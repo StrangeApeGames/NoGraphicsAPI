@@ -48,7 +48,9 @@ Debug builds enable `VK_EXT_debug_utils` and the Khronos validation layer when a
 ## GPU heaps and application-side allocation
 
 The backend requires device-local host-visible coherent memory for mapped heaps and descriptor
-heaps, plus compatible device-local memory for GPU-only heaps and textures. GPU-only selections
+heaps, plus compatible device-local memory for GPU-only heaps and textures. A readback heap is the
+exception: it requires host-visible coherent memory, prefers host-cached, and avoids device-local,
+so the CPU reads it from cached system memory on a discrete GPU. GPU-only selections
 prefer a non-host-visible type, but can use a host-visible UMA type without mapping or exposing it.
 There is no host-only or non-coherent fallback path.
 
