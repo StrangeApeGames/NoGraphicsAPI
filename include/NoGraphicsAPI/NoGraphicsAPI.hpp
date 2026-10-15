@@ -469,6 +469,8 @@ struct DeviceDesc
     uint32 desired_compute_queue_count = 0;
     uint32 desired_copy_queue_count = 0;
     uint32 timestamp_query_count = 256; // Per command buffer; zero disables timestamps.
+    // Vulkan: VK_LAYER_KHRONOS_validation when installed, its warnings and errors printed to stderr. Always on without NDEBUG.
+    bool validation = false;
 };
 
 struct DeviceInit

@@ -26,7 +26,8 @@ cmake --install build --config Release --prefix path/to/install
 
 For examples and tests, configure with `-DNOGRAPHICSAPI_BUILD_EXAMPLES=ON` and
 `-DNOGRAPHICSAPI_BUILD_TESTS=ON`, then run `ctest --test-dir build -C Release --output-on-failure`.
-Debug Vulkan builds enable validation when installed. Metal validation is opt-in through Xcode or
+Debug Vulkan builds enable validation when installed, and other builds with `DeviceDesc::validation`.
+Metal validation is opt-in through Xcode or
 `MTL_DEBUG_LAYER=1`; see [Metal validation](metal-validation.md) for supported instrumentation and known driver issues.
 Apple example/test shader builds require stock Slang 2026.18.2+ and Xcode's Metal compiler. Vulkan shader builds require
 Slang 2026.14.1+ and SPIRV-Tools 2026.3+. Shader tools are not required for a library-only build.

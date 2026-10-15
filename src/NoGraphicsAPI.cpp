@@ -173,7 +173,6 @@ bool has_name(Span<const VkExtensionProperties> values, const char* name)
     return false;
 }
 
-#if !defined(NDEBUG)
 bool has_name(Span<const VkLayerProperties> values, const char* name)
 {
     for (size_t index = 0; index < values.size; ++index)
@@ -197,7 +196,6 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
     }
     return VK_FALSE;
 }
-#endif
 
 VkFormat to_vk(Format format)
 {
@@ -1438,14 +1436,12 @@ Error enumerate_instance_extensions(Span<VkExtensionProperties> values, uint32& 
     return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceExtensionProperties");
 }
 
-#if !defined(NDEBUG)
 Error enumerate_instance_layers(Span<VkLayerProperties> values, uint32& count) noexcept
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateInstanceLayerProperties(&count, values.data);
     return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceLayerProperties");
 }
-#endif
 
 struct QueriedFeatures
 {
@@ -1741,24 +1737,28 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     constexpr bool khr_surface_maintenance1 = false;
     constexpr bool ext_surface_maintenance1 = false;
 #endif
-#if !defined(NDEBUG)
+#if defined(NDEBUG)
+    const bool validation = desc.validation;
+#else
+    const bool validation = true;
+#endif
     VkLayerProperties layers[max_instance_layers]{};
     uint32 layer_count = 0;
-    error = enumerate_instance_layers({layers, max_instance_layers}, layer_count);
-    if (error != Error::none)
-        return fail_device_creation(state, error);
-    const bool debug_utils_available = has_name({instance_extensions, instance_extension_count}, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    const bool validation_available = has_name({layers, layer_count}, "VK_LAYER_KHRONOS_validation");
-#endif
+    if (validation)
+    {
+        error = enumerate_instance_layers({layers, max_instance_layers}, layer_count);
+        if (error != Error::none)
+            return fail_device_creation(state, error);
+    }
+    const bool debug_utils_available = validation && has_name({instance_extensions, instance_extension_count}, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    const bool validation_available = validation && has_name({layers, layer_count}, "VK_LAYER_KHRONOS_validation");
 
     const char* enabled_instance_extensions[7]{};
     uint32 enabled_instance_extension_count = 0;
     const char* enabled_layers[1]{};
     uint32 enabled_layer_count = 0;
-#if !defined(NDEBUG)
     if (debug_utils_available) enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     if (validation_available) enabled_layers[enabled_layer_count++] = "VK_LAYER_KHRONOS_validation";
-#endif
 #if defined(_WIN32)
     if (presentation)
     {
@@ -1794,7 +1794,6 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     if (error != Error::none)
         return fail_device_creation(state, error);
 
-#if !defined(NDEBUG)
     if (debug_utils_available)
     {
         const PFN_vkCreateDebugUtilsMessengerEXT create_debug =
@@ -1813,7 +1812,6 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         if (error != Error::none)
             return fail_device_creation(state, error);
     }
-#endif
 
 #if defined(_WIN32)
     if (presentation)
