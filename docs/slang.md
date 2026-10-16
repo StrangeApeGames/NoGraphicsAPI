@@ -52,6 +52,7 @@ additional pointers inside the root can be selected by GPU work.
 | --- | --- | --- | --- |
 | Vulkan | Uniform buffer at binding 0, mapped to the 64-bit address in push data | Native resource descriptor heap | Native sampler descriptor heap |
 | Metal | `StructuredBuffer<T>` at buffer 0, preserving C layout | One 64-bit pool base at buffer 1 | Typed sampler entries at buffer 2 |
+| Vulkan [compatible tier](vulkan-support.md#compatible-tier) | A pointer read from the 64-bit address in a push constant | Sampled and storage image arrays at set 0, bindings 0 and 1 | Sampler array at set 0, binding 2 |
 
 `GPU_ROOT` preserves the shared C++ layout, including vectors, matrices and pointers, without adding
 backend fields. Plain Metal `ConstantBuffer<Type>` can use different alignment.

@@ -50,6 +50,7 @@ enum class MemoryType : uint8
     cpu_visible,
     gpu_only,
     readback,
+    upload, // CPU-written copy sources in system memory, where the Vulkan compatible tier keeps upload staging.
 };
 
 struct SizeAlign
@@ -432,9 +433,17 @@ constexpr Access operator|(Access lhs, Access rhs) noexcept
     return static_cast<Access>(static_cast<uint64>(lhs) | static_cast<uint64>(rhs));
 }
 
+// Which Vulkan path a device runs, picked once by create_device. See docs/vulkan-support.md.
+enum class DeviceTier : uint8
+{
+    full,
+    compatible,
+};
+
 struct DeviceCaps
 {
     const char* device_name = nullptr;
+    DeviceTier tier = DeviceTier::full;
     // Flat queue indices: general first, then compute-only, then copy-only. Queue zero supports presentation.
     uint32 queue_count = 0;
     uint32 general_queue_count = 0;
@@ -471,6 +480,14 @@ struct DeviceDesc
     uint32 timestamp_query_count = 256; // Per command buffer; zero disables timestamps.
     // Vulkan: VK_LAYER_KHRONOS_validation when installed, its warnings and errors printed to stderr. Always on without NDEBUG.
     bool validation = false;
+    // Vulkan: the compatible tier on a device that has the full one, to test it.
+    bool force_compatible_tier = false;
+    // Vulkan: present as a GPU without swapchain_maintenance1 does, to test it. Neither it nor surface_maintenance1 is enabled,
+    // so a windowed device runs the compatible tier and presents without present fences.
+    bool force_no_present_fences = false;
+    // Vulkan compatible tier: the slots of the device's one descriptor set, which its texture and sampler descriptor heaps share.
+    uint32 compatible_texture_descriptor_capacity = 65536;
+    uint32 compatible_sampler_descriptor_capacity = 256;
 };
 
 struct DeviceInit
@@ -718,8 +735,23 @@ void wait_idle(Device* device) noexcept;
 void submit_and_present(Device* device, const SubmitDesc& desc) noexcept;
 
 // Every non-null returned pointer is 16-byte aligned. GPU heaps are raw blocks for application-side suballocation.
+// On the Vulkan compatible tier, create and destroy GPU heaps while no other thread records commands: recording finds a
+// heap's buffer by address in a table those two change.
 [[nodiscard]] GpuHeap create_gpu_heap(Device* device, uint64 byte_count, MemoryType memory = MemoryType::cpu_visible) noexcept;
 void destroy_gpu_heap(const GpuHeap& heap) noexcept;
+
+// Vulkan compatible tier: the GPU heaps alive at once whose buffers the classic copy, index and indirect commands find by
+// address. Running out asserts.
+constexpr uint32 max_heap_buffers = 64;
+
+struct HeapBufferStats
+{
+    uint32 in_use = 0;
+    uint32 high_water = 0;
+};
+
+// Zero on the full tier, which has no table.
+[[nodiscard]] HeapBufferStats get_heap_buffer_stats(const Device* device) noexcept;
 
 template<typename T>
 [[nodiscard]] constexpr GpuRange gpu_range(GpuCpuRange<T> range) noexcept
@@ -749,6 +781,7 @@ void activate_texture_alias(CommandBuffer* commands, Texture* texture) noexcept;
 void destroy_render_view(RenderView* render_view) noexcept;
 // Descriptor slots form application-owned namespaces. Writes and copies require indices within capacity;
 // do not modify slots until all commands using their previous contents have completed. Copies may overlap.
+// On the Vulkan compatible tier, a device has one heap of each kind, within DeviceDesc's compatible capacities, and no copies.
 [[nodiscard]] TextureDescriptorHeap* create_texture_descriptor_heap(Device* device, uint32 capacity) noexcept;
 void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept;
 void write_texture_descriptor(TextureDescriptorHeap* heap, uint32 index, const Texture* texture, TextureDescriptorType type,
@@ -822,7 +855,7 @@ void draw_indexed_indirect(CommandBuffer* commands, const void* root, GpuRange i
 void dispatch(CommandBuffer* commands, const void* root, uint32x3 group_count) noexcept;
 void dispatch_indirect(CommandBuffer* commands, const void* root, GpuRange arguments) noexcept;
 void draw_meshlets(CommandBuffer* commands, const void* root, uint32x3 group_count) noexcept;
-// Requires DeviceCaps::indirect_mesh_draw. Direct task/mesh draws remain available on every supported device.
+// Requires DeviceCaps::indirect_mesh_draw. Direct task/mesh draws, and mesh PSOs, are on every Vulkan full-tier device and no compatible-tier one.
 void draw_meshlets_indirect(CommandBuffer* commands, const void* root, GpuRange arguments, uint32 draw_count = 1, uint32 stride = 0) noexcept;
 
 } // namespace gpu

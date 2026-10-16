@@ -749,6 +749,9 @@ void destroy_device(Device* device) noexcept
 
 const DeviceCaps& get_device_caps(const Device* device) noexcept { return device->caps; }
 
+// Metal has no compatible tier and no table of heap buffers.
+HeapBufferStats get_heap_buffer_stats(const Device*) noexcept { return {}; }
+
 bool supports_texture_format(const Device* device, Format format, TextureUsage usage) noexcept
 {
     if (pixel_format(format) == MTLPixelFormatInvalid || format == Format::d24_unorm_s8_uint) return false;

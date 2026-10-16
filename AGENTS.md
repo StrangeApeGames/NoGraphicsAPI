@@ -4,6 +4,7 @@
 - Target one fixed feature set on the latest GPUs and drivers. Avoid optional feature flags, feature queries, and fallback paths.
   Require features universally supported across the target hardware; otherwise ask the user before adding them.
   Preserve the supported baseline and any documented API capability exceptions. Do not silently emulate unsupported operations.
+  The one exception is the Vulkan compatible tier (approved Oct 15, 2026), kept in `src/NoGraphicsAPICompatible.cpp`; see `docs/vulkan-support.md`.
 - Do not add obvious comments such as "arguments must be live objects". C/C++ programmers already understand that using destroyed objects is invalid.
 - Do not add asserts or comments describing 32-bit overflow cases. The existing 32-bit ranges (about 4 billion elements or 4 GB) are sufficient.
 - Do not use C++ standard-library headers or facilities in project code, including utilities, examples, and tests.

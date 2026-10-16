@@ -515,6 +515,25 @@ struct BackingBuffer
     VkDeviceAddress address = 0;
 };
 
+// The compatible tier's stand-in for the descriptor heaps. Made by create_device, it lives until the device is destroyed.
+// Slot i of each binding is the heap index i that write_texture_descriptor and write_sampler_descriptor were given.
+struct CompatibleDescriptors
+{
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE; // binding 0 sampled images[], 1 storage images[], 2 samplers[]; update-after-bind, partially bound
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;              // the one set, which set_texture_descriptor_heap and set_sampler_descriptor_heap bind
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE; // that set and 8 bytes of push constants, the root's GPU address
+};
+
+// A GPU heap's block as the compatible tier's classic buffer commands need it, found by address. Added by
+// create_gpu_heap and removed by destroy_gpu_heap.
+struct HeapBuffer
+{
+    VkDeviceAddress first_address = 0;
+    VkDeviceSize byte_count = 0;
+    VkBuffer buffer = VK_NULL_HANDLE; // the heap's backing buffer, which covers the whole block
+};
+
 struct PresentContext;
 
 struct DeferredSwapchainImage
@@ -598,6 +617,7 @@ struct TextureDescriptorHeap
     Device* state = nullptr;
     GpuHeap storage = {};
     uint32 capacity = 0;
+    VkImageView* compatible_views = nullptr; // compatible tier: each slot's view, destroyed when the slot is written again
 };
 
 struct SamplerDescriptorHeap
@@ -605,6 +625,7 @@ struct SamplerDescriptorHeap
     Device* state = nullptr;
     GpuHeap storage = {};
     uint32 capacity = 0;
+    VkSampler* compatible_samplers = nullptr; // compatible tier: each slot's sampler, destroyed when the slot is written again
 };
 
 struct TextureHeapOwner
@@ -633,6 +654,7 @@ struct CommandBuffer
     Swapchain* swapchain = nullptr;
     bool submitted = false;
     bool has_epilogue = false;
+    bool graphics = false; // on a general queue, so the compatible tier binds its descriptor set for graphics too
 };
 
 struct CommandPool
@@ -643,6 +665,7 @@ struct CommandPool
     CommandBuffer* last = nullptr;
     CommandBuffer* next_buffer = nullptr;
     bool timestamps = false;
+    bool graphics = false;
 };
 
 namespace detail
@@ -666,6 +689,7 @@ struct PresentContext
     VkFence presented = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     bool present_pending = false;
+    uint64 acquire_retirement = 0; // without present fences: the presentation retirement value of the submit that waited on 'acquired'
 };
 
 } // namespace detail
@@ -704,6 +728,13 @@ struct Device
     Swapchain* acquired_swapchain = nullptr;
     uint32 present_context_count = 0;
     uint32 next_present_context = 0;
+    // A windowed device with swapchain_maintenance1. Without it the compatible tier presents the classic way: see NoGraphicsAPICompatible.cpp.
+    bool present_fences = false;
+    // The compatible tier's alone: see NoGraphicsAPICompatible.cpp.
+    detail::CompatibleDescriptors compatible_descriptors;
+    detail::HeapBuffer heap_buffers[max_heap_buffers]{};
+    uint32 heap_buffer_count = 0;
+    uint32 heap_buffer_high_water = 0;
 
     ~Device();
 
@@ -848,6 +879,14 @@ struct Device
 namespace
 {
 
+// The compatible tier's code is in NoGraphicsAPICompatible.cpp, which this file includes after the structs it needs.
+// These two are called before that.
+namespace compatible
+{
+void destroy_descriptors(Device& device) noexcept;
+void add_heap_buffer(Device& device, const detail::BackingBuffer& backing, VkDeviceSize byte_count) noexcept;
+} // namespace compatible
+
 VkMemoryRequirements buffer_memory_requirements(Device& device, VkBufferUsageFlags usage) noexcept
 {
     const VkBufferCreateInfo buffer_info{
@@ -869,7 +908,7 @@ VkMemoryRequirements buffer_memory_requirements(Device& device, VkBufferUsageFla
     return requirements.memoryRequirements;
 }
 
-bool supports_gpu_heap_memory(Device& device) noexcept
+bool supports_gpu_heap_memory(Device& device, DeviceTier tier) noexcept
 {
     const VkMemoryRequirements ordinary = buffer_memory_requirements(device, universal_buffer_usage);
     uint32 memory_type = 0;
@@ -879,6 +918,7 @@ bool supports_gpu_heap_memory(Device& device) noexcept
     {
         return false;
     }
+    if (tier == DeviceTier::compatible) return true; // it has no descriptor heaps
     const VkMemoryRequirements descriptor = buffer_memory_requirements(device, universal_buffer_usage | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT);
     return device.find_memory_type(descriptor.memoryTypeBits, cpu_visible_memory_properties, 0, descriptor.size, memory_type);
 }
@@ -1057,6 +1097,7 @@ Device::~Device()
         destroy_owned_swapchain(*this);
         swapchain_delete_queue.collect(device, completed_presentation_retirement);
         assert(swapchain_delete_queue.count == 0);
+        if (caps.tier == DeviceTier::compatible) compatible::destroy_descriptors(*this);
     }
     if (device && presentation_retirement) vkDestroySemaphore(device, presentation_retirement, nullptr);
     for (uint32 index = 0; index < queue_count; ++index)
@@ -1143,6 +1184,9 @@ Error Device::create_present_context(detail::PresentContext& context) noexcept
     Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.acquired), "vkCreateSemaphore (acquire)");
     if (error != Error::none)
         return error;
+    // Without present fences the render-finished semaphores are the swapchain images': see compatible::create_image_semaphores.
+    if (!present_fences)
+        return Error::none;
     error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.rendered), "vkCreateSemaphore (render)");
     if (error != Error::none)
     {
@@ -1187,6 +1231,12 @@ void Device::finish_present_context(detail::PresentContext& context) noexcept
 
 void Device::wait_present_context(detail::PresentContext& context) noexcept
 {
+    // Without present fences, all a context holds is its acquire semaphore, free once the submit that waited on it completes.
+    if (!present_fences)
+    {
+        wait_presentation_retirement(context.acquire_retirement);
+        return;
+    }
     if (!context.present_pending)
         return;
     assert_vk(vkWaitForFences(device, 1, &context.presented, VK_TRUE, ~uint64{0}));
@@ -1258,6 +1308,11 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
         preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         avoided = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         break;
+    case MemoryType::upload:
+        // Only copies read it, so it stays out of the device-local CPU-visible memory a GPU without Resizable BAR has little of.
+        required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        avoided = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        break;
     default:
         assert(false && "create_gpu_heap received an invalid memory type");
         return {};
@@ -1269,6 +1324,7 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
         delete heap;
         return {};
     }
+    if (caps.tier == DeviceTier::compatible) compatible::add_heap_buffer(*this, heap->backing, size);
     return {
         .range = {
             .cpu = static_cast<byte*>(heap->backing.mapped),
@@ -1347,6 +1403,7 @@ struct Swapchain
     VkImage images[max_swapchain_images]{};
     RenderView render_views[max_swapchain_images]{};
     bool initialized[max_swapchain_images]{};
+    VkSemaphore rendered[max_swapchain_images]{}; // without present fences: each image's render-finished semaphore
     uint32 image_count = 0;
     uint32 image_index = 0;
     uint32 width = 0;
@@ -1449,7 +1506,7 @@ struct QueriedFeatures
     VkPhysicalDeviceVulkan11Features vulkan11{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features vulkan12{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features vulkan13{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceVulkan14Features vulkan14{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES};
+    VkPhysicalDeviceMaintenance5Features maintenance5{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES};
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
     VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR address_commands{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_ADDRESS_COMMANDS_FEATURES_KHR};
     VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
@@ -1457,24 +1514,67 @@ struct QueriedFeatures
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance1{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 
-    explicit QueriedFeatures(bool presentation, bool include_unified_image_layouts)
+    // Chains only what the device can report: maintenance5 when it has it, through Vulkan 1.4 or its extension, and the
+    // full tier's structures when it has their extensions.
+    QueriedFeatures(bool has_maintenance5, bool full_tier_extensions, bool presentation, bool include_unified_image_layouts)
     {
         core.pNext = &vulkan11;
         vulkan11.pNext = &vulkan12;
         vulkan12.pNext = &vulkan13;
-        vulkan13.pNext = &vulkan14;
-        vulkan14.pNext = &descriptor_heap;
-        descriptor_heap.pNext = &address_commands;
-        address_commands.pNext = &untyped_pointers;
-        untyped_pointers.pNext = include_unified_image_layouts ? static_cast<void*>(&unified_image_layouts) : static_cast<void*>(&mesh_shader);
-        unified_image_layouts.pNext = &mesh_shader;
-        mesh_shader.pNext = presentation ? &swapchain_maintenance1 : nullptr;
+        void** next = &vulkan13.pNext;
+        if (has_maintenance5)
+        {
+            *next = &maintenance5;
+            next = &maintenance5.pNext;
+        }
+        if (full_tier_extensions)
+        {
+            *next = &descriptor_heap;
+            descriptor_heap.pNext = &address_commands;
+            address_commands.pNext = &untyped_pointers;
+            untyped_pointers.pNext = &mesh_shader;
+            next = &mesh_shader.pNext;
+        }
+        if (include_unified_image_layouts)
+        {
+            *next = &unified_image_layouts;
+            next = &unified_image_layouts.pNext;
+        }
+        if (presentation)
+            *next = &swapchain_maintenance1;
     }
 };
+
+// What a device lacks for either tier, named: the end of the one line create_device reports when no device fits.
+struct MissingRequirements
+{
+    char names[512]{};
+    uint32 length = 0;
+};
+
+// A feature both tiers need, and its name for that line.
+struct RequiredFeature
+{
+    VkBool32 supported = VK_FALSE;
+    const char* name = nullptr;
+};
+
+void note_missing(MissingRequirements& missing, const char* name) noexcept
+{
+    const char* separator = missing.length == 0 ? "" : ", ";
+    const int written = snprintf(missing.names + missing.length, sizeof(missing.names) - missing.length, "%s%s", separator, name);
+    const uint32 longest = sizeof(missing.names) - 1;
+    missing.length += static_cast<uint32>(written);
+    if (missing.length > longest)
+        missing.length = longest;
+}
 
 struct Candidate
 {
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+    DeviceTier tier = DeviceTier::full;
+    bool maintenance5_extension = false; // a Vulkan 1.3 device, which has maintenance5 as VK_KHR_maintenance5
+    MissingRequirements missing;         // what it lacks, when no tier fits it
     uint32 queue_families[queue_type_count]{};
     uint32 queue_counts[queue_type_count]{};
     bool timestamps[queue_type_count]{};
@@ -1487,11 +1587,25 @@ struct Candidate
     bool texture_compression_astc = false;
     bool texture_compression_etc2 = false;
     bool storage_input_output16 = false;
+    bool present_fences = false; // a windowed device with swapchain_maintenance1
     bool khr_swapchain_maintenance1 = false;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
     VkPhysicalDeviceVulkan12Properties vulkan12_properties{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
 };
 
+// Defined further down, and called by the compatible tier's presentation as well.
+void submit_commands(Device* device, const SubmitDesc& desc, uint32 queue_index, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore) noexcept;
+[[nodiscard]] bool swapchain_surface_configuration_changed(const Swapchain& swapchain) noexcept;
+
+} // namespace
+
+#include "NoGraphicsAPICompatible.cpp"
+
+namespace
+{
+
+// A device fits the full tier when it has everything, and otherwise the compatible tier. A device that fits neither, and
+// returns Error::unsupported, has its properties and what it lacks in 'output' for the message create_device reports.
 Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool khr_surface_maintenance1, bool ext_surface_maintenance1,
                         const DeviceDesc& desc, Candidate& output) noexcept
 {
@@ -1503,42 +1617,46 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
     const bool unified_image_layouts_extension = has_name(
         {extensions, extension_count},
         VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
-    constexpr const char* required_extensions[]{
+    constexpr const char* full_tier_extensions[]{
         VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
         VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME,
         VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
         VK_EXT_MESH_SHADER_EXTENSION_NAME,
     };
-    for (const char* name : required_extensions)
+    bool has_full_tier_extensions = true;
+    for (const char* name : full_tier_extensions)
     {
         if (!has_name({extensions, extension_count}, name))
-            return Error::unsupported;
+            has_full_tier_extensions = false;
     }
     const bool khr_swapchain_maintenance1 = khr_surface_maintenance1 &&
                                             has_name({extensions, extension_count}, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
     const bool ext_swapchain_maintenance1 = ext_surface_maintenance1 &&
                                             has_name({extensions, extension_count}, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
-    if (surface &&
-        (!has_name({extensions, extension_count}, VK_KHR_SWAPCHAIN_EXTENSION_NAME) ||
-         (!khr_swapchain_maintenance1 && !ext_swapchain_maintenance1)))
-    {
-        return Error::unsupported;
-    }
+    const bool has_swapchain = has_name({extensions, extension_count}, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    const bool has_swapchain_maintenance1 = has_swapchain && (khr_swapchain_maintenance1 || ext_swapchain_maintenance1);
 
     Candidate result{
         .physical_device = physical_device,
     };
-    result.heap_properties.pNext = &result.vulkan12_properties;
+    if (has_full_tier_extensions)
+        result.vulkan12_properties.pNext = &result.heap_properties;
     VkPhysicalDeviceProperties2 properties2{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &result.heap_properties,
+        .pNext = &result.vulkan12_properties,
     };
     vkGetPhysicalDeviceProperties2(physical_device, &properties2);
     result.properties = properties2.properties;
     result.heap_properties.pNext = nullptr;
     result.vulkan12_properties.pNext = nullptr;
-    if (result.properties.apiVersion < VK_API_VERSION_1_4)
+    if (result.properties.apiVersion < VK_API_VERSION_1_3)
+    {
+        note_missing(result.missing, "Vulkan 1.3");
+        output = result;
         return Error::unsupported;
+    }
+    result.maintenance5_extension = result.properties.apiVersion < VK_API_VERSION_1_4;
+    const bool has_maintenance5 = !result.maintenance5_extension || has_name({extensions, extension_count}, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 
     vkGetPhysicalDeviceMemoryProperties(physical_device, &result.memory_properties);
     bool cpu_visible_memory = false;
@@ -1551,47 +1669,62 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
             break;
         }
     }
-    if (!cpu_visible_memory) return Error::unsupported;
+    if (!cpu_visible_memory)
+        note_missing(result.missing, "device-local CPU-visible memory");
 
-    QueriedFeatures features(surface != VK_NULL_HANDLE, unified_image_layouts_extension);
+    QueriedFeatures features(has_maintenance5, has_full_tier_extensions, surface && has_swapchain_maintenance1, unified_image_layouts_extension);
     vkGetPhysicalDeviceFeatures2(physical_device, &features.core);
-    const bool required_features =
-        features.core.features.shaderInt16 == VK_TRUE &&
-        features.core.features.samplerAnisotropy == VK_TRUE &&
-        features.core.features.depthBiasClamp == VK_TRUE &&
-        features.core.features.independentBlend == VK_TRUE &&
-        features.core.features.fragmentStoresAndAtomics == VK_TRUE &&
-        features.core.features.vertexPipelineStoresAndAtomics == VK_TRUE &&
-        features.core.features.shaderStorageImageReadWithoutFormat == VK_TRUE &&
-        features.core.features.shaderStorageImageWriteWithoutFormat == VK_TRUE &&
-        features.core.features.multiDrawIndirect == VK_TRUE &&
-        features.core.features.drawIndirectFirstInstance == VK_TRUE &&
-        features.vulkan11.storageBuffer16BitAccess == VK_TRUE &&
+    const VkBool32 has_texture_compression = features.core.features.textureCompressionBC | features.core.features.textureCompressionASTC_LDR;
+    // Present fences come with swapchain_maintenance1. The full tier needs them to present; the compatible tier presents
+    // without them when the device lacks it.
+    const bool presents_with_fences = surface && has_swapchain_maintenance1 && features.swapchain_maintenance1.swapchainMaintenance1 == VK_TRUE;
+    const RequiredFeature both_tiers_features[]{
+        {.supported = features.core.features.shaderInt16, .name = "shaderInt16"},
+        {.supported = features.core.features.samplerAnisotropy, .name = "samplerAnisotropy"},
+        {.supported = features.core.features.depthBiasClamp, .name = "depthBiasClamp"},
+        {.supported = features.core.features.independentBlend, .name = "independentBlend"},
+        {.supported = features.core.features.fragmentStoresAndAtomics, .name = "fragmentStoresAndAtomics"},
+        {.supported = features.core.features.vertexPipelineStoresAndAtomics, .name = "vertexPipelineStoresAndAtomics"},
+        {.supported = features.core.features.shaderStorageImageReadWithoutFormat, .name = "shaderStorageImageReadWithoutFormat"},
+        {.supported = features.core.features.shaderStorageImageWriteWithoutFormat, .name = "shaderStorageImageWriteWithoutFormat"},
+        {.supported = features.core.features.multiDrawIndirect, .name = "multiDrawIndirect"},
+        {.supported = features.core.features.drawIndirectFirstInstance, .name = "drawIndirectFirstInstance"},
+        {.supported = features.vulkan11.storageBuffer16BitAccess, .name = "storageBuffer16BitAccess"},
+        {.supported = features.vulkan11.shaderDrawParameters, .name = "shaderDrawParameters"},
+        {.supported = features.vulkan12.scalarBlockLayout, .name = "scalarBlockLayout"},
+        {.supported = features.vulkan12.bufferDeviceAddress, .name = "bufferDeviceAddress"},
+        {.supported = features.vulkan12.timelineSemaphore, .name = "timelineSemaphore"},
+        {.supported = features.vulkan13.synchronization2, .name = "synchronization2"},
+        {.supported = features.vulkan13.dynamicRendering, .name = "dynamicRendering"},
+        {.supported = features.vulkan13.maintenance4, .name = "maintenance4"},
+        {.supported = features.maintenance5.maintenance5, .name = "maintenance5"},
+        {.supported = has_texture_compression, .name = "BC or ASTC textures"},
+        {.supported = !surface || has_swapchain, .name = "VK_KHR_swapchain"},
+    };
+    for (const RequiredFeature& feature : both_tiers_features)
+    {
+        if (feature.supported != VK_TRUE)
+            note_missing(result.missing, feature.name);
+    }
+    const bool has_full_tier = has_full_tier_extensions &&
+        result.properties.apiVersion >= VK_API_VERSION_1_4 &&
         features.vulkan11.storagePushConstant16 == VK_TRUE &&
-        features.vulkan11.shaderDrawParameters == VK_TRUE &&
         features.vulkan12.shaderFloat16 == VK_TRUE &&
-        features.vulkan12.scalarBlockLayout == VK_TRUE &&
-        features.vulkan12.bufferDeviceAddress == VK_TRUE &&
-        features.vulkan12.timelineSemaphore == VK_TRUE &&
-        features.vulkan13.synchronization2 == VK_TRUE &&
-        features.vulkan13.dynamicRendering == VK_TRUE &&
-        features.vulkan13.maintenance4 == VK_TRUE &&
-        features.vulkan14.maintenance5 == VK_TRUE &&
         features.descriptor_heap.descriptorHeap == VK_TRUE &&
         features.address_commands.deviceAddressCommands == VK_TRUE &&
         features.untyped_pointers.shaderUntypedPointers == VK_TRUE &&
         features.mesh_shader.meshShader == VK_TRUE &&
-        (features.core.features.textureCompressionBC == VK_TRUE ||
-         features.core.features.textureCompressionASTC_LDR == VK_TRUE) &&
-        (!surface || features.swapchain_maintenance1.swapchainMaintenance1 == VK_TRUE);
-    if (!required_features)
-        return Error::unsupported;
+        (!surface || presents_with_fences);
+    result.tier = has_full_tier && !desc.force_compatible_tier ? DeviceTier::full : DeviceTier::compatible;
+    if (result.tier == DeviceTier::compatible)
+        compatible::note_missing_requirements(features, result.vulkan12_properties, desc, result.missing);
     result.unified_image_layouts = unified_image_layouts_extension && features.unified_image_layouts.unifiedImageLayouts == VK_TRUE;
     result.image_cube_array = features.core.features.imageCubeArray == VK_TRUE;
     result.texture_compression_bc = features.core.features.textureCompressionBC == VK_TRUE;
     result.texture_compression_astc = features.core.features.textureCompressionASTC_LDR == VK_TRUE;
     result.texture_compression_etc2 = features.core.features.textureCompressionETC2 == VK_TRUE;
     result.storage_input_output16 = features.vulkan11.storageInputOutput16 == VK_TRUE;
+    result.present_fences = presents_with_fences;
     result.khr_swapchain_maintenance1 = khr_swapchain_maintenance1;
 
     uint32 available_queue_count = 0;
@@ -1648,12 +1781,15 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
             }
         }
     }
-    if (result.queue_counts[0] == 0 || (desc.desired_compute_queue_count && result.queue_counts[1] == 0) ||
-        (desc.desired_copy_queue_count && result.queue_counts[2] == 0))
-        return Error::unsupported;
+    if (result.queue_counts[0] == 0)
+        note_missing(result.missing, surface ? "a graphics queue that presents to the window" : "a graphics queue");
+    if (desc.desired_compute_queue_count && result.queue_counts[1] == 0)
+        note_missing(result.missing, "a compute-only queue");
+    if (desc.desired_copy_queue_count && result.queue_counts[2] == 0)
+        note_missing(result.missing, "a copy-only queue");
 
     output = result;
-    return Error::none;
+    return result.missing.length == 0 ? Error::none : Error::unsupported;
 }
 
 Error enumerate_physical_devices(VkInstance instance, Span<VkPhysicalDevice> values, uint32& count) noexcept
@@ -1697,9 +1833,9 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     Error error = error_from_vk(vkEnumerateInstanceVersion(&loader_version), "vkEnumerateInstanceVersion");
     if (error != Error::none)
         return { .error = error };
-    if (loader_version < VK_API_VERSION_1_4)
+    if (loader_version < VK_API_VERSION_1_3)
     {
-        if (error_callback) error_callback("Vulkan 1.4 or newer is required. Update the graphics driver.", false);
+        if (error_callback) error_callback("Vulkan 1.3 or newer is required. Update the graphics driver.", false);
         return { .error = Error::unsupported };
     }
 
@@ -1716,10 +1852,11 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         has_name({instance_extensions, instance_extension_count}, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     if (presentation && desc.swapchain_color_space != ColorSpace::srgb && !state->swapchain_color_space_enabled)
         return fail_device_creation(state, Error::unsupported);
-    const bool khr_surface_maintenance1 = presentation && has_name(
+    // Without surface_maintenance1 only the compatible tier can present: see inspect_candidate.
+    const bool khr_surface_maintenance1 = presentation && !desc.force_no_present_fences && has_name(
         {instance_extensions, instance_extension_count},
         VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-    const bool ext_surface_maintenance1 = presentation && has_name(
+    const bool ext_surface_maintenance1 = presentation && !desc.force_no_present_fences && has_name(
         {instance_extensions, instance_extension_count},
         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
     if (presentation &&
@@ -1728,8 +1865,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
          !has_name({instance_extensions, instance_extension_count},
                    VK_KHR_WIN32_SURFACE_EXTENSION_NAME) ||
          !has_name({instance_extensions, instance_extension_count},
-                   VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) ||
-         (!khr_surface_maintenance1 && !ext_surface_maintenance1)))
+                   VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)))
     {
         return fail_device_creation(state, Error::unsupported);
     }
@@ -1835,29 +1971,44 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 
     Candidate selected{};
     bool has_selected = false;
+    Candidate refused{}; // the GPU the message names when none fits: the first discrete one, or else the first
     for (uint32 index = 0; index < physical_device_count; ++index)
     {
         const VkPhysicalDevice physical_device = physical_devices[index];
         Candidate candidate{};
         error = inspect_candidate(physical_device, state->surface, khr_surface_maintenance1, ext_surface_maintenance1, desc, candidate);
+        const bool is_discrete = candidate.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
         if (error == Error::unsupported)
+        {
+            const bool names_a_better_gpu = !refused.physical_device || (is_discrete && refused.properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+            if (candidate.physical_device && names_a_better_gpu)
+                refused = candidate;
             continue;
+        }
         if (error != Error::none)
             return fail_device_creation(state, error);
-        if (!has_selected || candidate.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        if (!has_selected || is_discrete)
         {
             selected = candidate;
             has_selected = true;
         }
-        if (candidate.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        if (is_discrete)
             break;
     }
     if (!has_selected)
-        return fail_device_creation(state, Error::unsupported,
-            "No compatible GPU found. Vulkan 1.4, VK_EXT_descriptor_heap, VK_KHR_device_address_commands, VK_EXT_mesh_shader, "
-            "VK_KHR_shader_untyped_pointers, and the required memory, shader, and presentation features are needed.");
+    {
+        char message[1024];
+        if (refused.physical_device)
+            snprintf(message, sizeof(message), "The GPU cannot run this. %s, with the driver %s %s, lacks: %s.", refused.properties.deviceName,
+                     refused.vulkan12_properties.driverName, refused.vulkan12_properties.driverInfo, refused.missing.names);
+        else
+            snprintf(message, sizeof(message), "No GPU with Vulkan 1.3 was found. Update the graphics driver.");
+        return fail_device_creation(state, Error::unsupported, message);
+    }
+    const bool full_tier = selected.tier == DeviceTier::full;
 
     state->physical_device = selected.physical_device;
+    state->present_fences = selected.present_fences;
     state->physical_properties = selected.properties;
     state->heap_properties = selected.heap_properties;
     state->max_timeline_value_difference = selected.vulkan12_properties.maxTimelineSemaphoreValueDifference;
@@ -1869,7 +2020,8 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             state->physical_device, static_cast<Format>(value));
     }
 
-    QueriedFeatures enabled_features(presentation, selected.unified_image_layouts);
+    const bool has_maintenance5 = true; // both tiers require it
+    QueriedFeatures enabled_features(has_maintenance5, full_tier, selected.present_fences, selected.unified_image_layouts);
     state->texture_compression_etc2 = selected.texture_compression_etc2;
     enabled_features.core.features.imageCubeArray = selected.image_cube_array;
     enabled_features.core.features.samplerAnisotropy = VK_TRUE;
@@ -1886,10 +2038,8 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.core.features.multiDrawIndirect = VK_TRUE;
     enabled_features.core.features.drawIndirectFirstInstance = VK_TRUE;
     enabled_features.vulkan11.storageBuffer16BitAccess = VK_TRUE;
-    enabled_features.vulkan11.storagePushConstant16 = VK_TRUE;
     enabled_features.vulkan11.storageInputOutput16 = selected.storage_input_output16;
     enabled_features.vulkan11.shaderDrawParameters = VK_TRUE;
-    enabled_features.vulkan12.shaderFloat16 = VK_TRUE;
     enabled_features.vulkan12.scalarBlockLayout = VK_TRUE;
     enabled_features.vulkan12.timelineSemaphore = VK_TRUE;
     enabled_features.vulkan12.hostQueryReset = selected.timestamps[0] || selected.timestamps[1] || selected.timestamps[2];
@@ -1897,14 +2047,23 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.vulkan13.synchronization2 = VK_TRUE;
     enabled_features.vulkan13.dynamicRendering = VK_TRUE;
     enabled_features.vulkan13.maintenance4 = VK_TRUE;
-    enabled_features.vulkan14.maintenance5 = VK_TRUE;
-    enabled_features.descriptor_heap.descriptorHeap = VK_TRUE;
-    enabled_features.address_commands.deviceAddressCommands = VK_TRUE;
-    enabled_features.untyped_pointers.shaderUntypedPointers = VK_TRUE;
+    enabled_features.maintenance5.maintenance5 = VK_TRUE;
     enabled_features.unified_image_layouts.unifiedImageLayouts = selected.unified_image_layouts ? VK_TRUE : VK_FALSE;
-    enabled_features.mesh_shader.taskShader = VK_TRUE;
-    enabled_features.mesh_shader.meshShader = VK_TRUE;
     enabled_features.swapchain_maintenance1.swapchainMaintenance1 = VK_TRUE;
+    if (full_tier)
+    {
+        enabled_features.vulkan11.storagePushConstant16 = VK_TRUE;
+        enabled_features.vulkan12.shaderFloat16 = VK_TRUE;
+        enabled_features.descriptor_heap.descriptorHeap = VK_TRUE;
+        enabled_features.address_commands.deviceAddressCommands = VK_TRUE;
+        enabled_features.untyped_pointers.shaderUntypedPointers = VK_TRUE;
+        enabled_features.mesh_shader.taskShader = VK_TRUE;
+        enabled_features.mesh_shader.meshShader = VK_TRUE;
+    }
+    else
+    {
+        compatible::enable_features(enabled_features);
+    }
 
     const uint32 requested_counts[]{desc.desired_queue_count, desc.desired_compute_queue_count, desc.desired_copy_queue_count};
     uint32 queue_counts[queue_type_count]{};
@@ -1933,21 +2092,31 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     }
     const char* enabled_device_extensions[7]{};
     uint32 enabled_device_extension_count = 0;
-    enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME;
-    enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME;
-    enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME;
+    if (full_tier)
+    {
+        enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME;
+        enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME;
+        enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME;
+        enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+    }
     if (selected.unified_image_layouts)
     {
         enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
     }
-    enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+    if (selected.maintenance5_extension)
+    {
+        enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    }
 #if defined(_WIN32)
     if (presentation)
     {
         enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-        enabled_device_extensions[enabled_device_extension_count++] = selected.khr_swapchain_maintenance1
-            ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
-            : VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+        if (selected.present_fences)
+        {
+            enabled_device_extensions[enabled_device_extension_count++] = selected.khr_swapchain_maintenance1
+                ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
+                : VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+        }
     }
 #endif
     const VkDeviceCreateInfo device_info{
@@ -1973,32 +2142,36 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             vkGetDeviceQueue(state->device, queue.family_index, index, &queue.queue);
         }
     }
-    if (!supports_gpu_heap_memory(*state) || !select_texture_memory_type(*state))
+    if (!supports_gpu_heap_memory(*state, selected.tier) || !select_texture_memory_type(*state))
         return fail_device_creation(state, Error::unsupported);
 
-    state->fn.write_sampler_descriptors = load_device_proc<PFN_vkWriteSamplerDescriptorsEXT>(state->device, "vkWriteSamplerDescriptorsEXT");
-    state->fn.write_resource_descriptors = load_device_proc<PFN_vkWriteResourceDescriptorsEXT>(state->device, "vkWriteResourceDescriptorsEXT");
-    state->fn.cmd_bind_sampler_heap = load_device_proc<PFN_vkCmdBindSamplerHeapEXT>(state->device, "vkCmdBindSamplerHeapEXT");
-    state->fn.cmd_bind_texture_heap = load_device_proc<PFN_vkCmdBindResourceHeapEXT>(state->device, "vkCmdBindResourceHeapEXT");
-    state->fn.cmd_push_data = load_device_proc<PFN_vkCmdPushDataEXT>(state->device, "vkCmdPushDataEXT");
-    state->fn.cmd_bind_index_buffer = load_device_proc<PFN_vkCmdBindIndexBuffer3KHR>(state->device, "vkCmdBindIndexBuffer3KHR");
-    state->fn.cmd_draw_indirect = load_device_proc<PFN_vkCmdDrawIndirect2KHR>(state->device, "vkCmdDrawIndirect2KHR");
-    state->fn.cmd_draw_indexed_indirect = load_device_proc<PFN_vkCmdDrawIndexedIndirect2KHR>(state->device, "vkCmdDrawIndexedIndirect2KHR");
-    state->fn.cmd_dispatch_indirect = load_device_proc<PFN_vkCmdDispatchIndirect2KHR>(state->device, "vkCmdDispatchIndirect2KHR");
-    state->fn.cmd_draw_mesh_tasks = load_device_proc<PFN_vkCmdDrawMeshTasksEXT>(state->device, "vkCmdDrawMeshTasksEXT");
-    state->fn.cmd_draw_mesh_tasks_indirect = load_device_proc<PFN_vkCmdDrawMeshTasksIndirect2EXT>(state->device, "vkCmdDrawMeshTasksIndirect2EXT");
-    state->fn.cmd_copy_memory = load_device_proc<PFN_vkCmdCopyMemoryKHR>(state->device, "vkCmdCopyMemoryKHR");
-    state->fn.cmd_copy_memory_to_image = load_device_proc<PFN_vkCmdCopyMemoryToImageKHR>(state->device, "vkCmdCopyMemoryToImageKHR");
-    state->fn.cmd_copy_image_to_memory = load_device_proc<PFN_vkCmdCopyImageToMemoryKHR>(state->device, "vkCmdCopyImageToMemoryKHR");
-    if (!state->fn.write_sampler_descriptors || !state->fn.write_resource_descriptors ||
-        !state->fn.cmd_bind_sampler_heap || !state->fn.cmd_bind_texture_heap ||
-        !state->fn.cmd_push_data || !state->fn.cmd_bind_index_buffer ||
-        !state->fn.cmd_draw_indirect || !state->fn.cmd_draw_indexed_indirect ||
-        !state->fn.cmd_dispatch_indirect || !state->fn.cmd_draw_mesh_tasks ||
-        !state->fn.cmd_draw_mesh_tasks_indirect || !state->fn.cmd_copy_memory ||
-        !state->fn.cmd_copy_memory_to_image || !state->fn.cmd_copy_image_to_memory)
+    // The compatible tier calls the core commands these replace.
+    if (full_tier)
     {
-        return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide the required Vulkan command entry points.");
+        state->fn.write_sampler_descriptors = load_device_proc<PFN_vkWriteSamplerDescriptorsEXT>(state->device, "vkWriteSamplerDescriptorsEXT");
+        state->fn.write_resource_descriptors = load_device_proc<PFN_vkWriteResourceDescriptorsEXT>(state->device, "vkWriteResourceDescriptorsEXT");
+        state->fn.cmd_bind_sampler_heap = load_device_proc<PFN_vkCmdBindSamplerHeapEXT>(state->device, "vkCmdBindSamplerHeapEXT");
+        state->fn.cmd_bind_texture_heap = load_device_proc<PFN_vkCmdBindResourceHeapEXT>(state->device, "vkCmdBindResourceHeapEXT");
+        state->fn.cmd_push_data = load_device_proc<PFN_vkCmdPushDataEXT>(state->device, "vkCmdPushDataEXT");
+        state->fn.cmd_bind_index_buffer = load_device_proc<PFN_vkCmdBindIndexBuffer3KHR>(state->device, "vkCmdBindIndexBuffer3KHR");
+        state->fn.cmd_draw_indirect = load_device_proc<PFN_vkCmdDrawIndirect2KHR>(state->device, "vkCmdDrawIndirect2KHR");
+        state->fn.cmd_draw_indexed_indirect = load_device_proc<PFN_vkCmdDrawIndexedIndirect2KHR>(state->device, "vkCmdDrawIndexedIndirect2KHR");
+        state->fn.cmd_dispatch_indirect = load_device_proc<PFN_vkCmdDispatchIndirect2KHR>(state->device, "vkCmdDispatchIndirect2KHR");
+        state->fn.cmd_draw_mesh_tasks = load_device_proc<PFN_vkCmdDrawMeshTasksEXT>(state->device, "vkCmdDrawMeshTasksEXT");
+        state->fn.cmd_draw_mesh_tasks_indirect = load_device_proc<PFN_vkCmdDrawMeshTasksIndirect2EXT>(state->device, "vkCmdDrawMeshTasksIndirect2EXT");
+        state->fn.cmd_copy_memory = load_device_proc<PFN_vkCmdCopyMemoryKHR>(state->device, "vkCmdCopyMemoryKHR");
+        state->fn.cmd_copy_memory_to_image = load_device_proc<PFN_vkCmdCopyMemoryToImageKHR>(state->device, "vkCmdCopyMemoryToImageKHR");
+        state->fn.cmd_copy_image_to_memory = load_device_proc<PFN_vkCmdCopyImageToMemoryKHR>(state->device, "vkCmdCopyImageToMemoryKHR");
+        if (!state->fn.write_sampler_descriptors || !state->fn.write_resource_descriptors ||
+            !state->fn.cmd_bind_sampler_heap || !state->fn.cmd_bind_texture_heap ||
+            !state->fn.cmd_push_data || !state->fn.cmd_bind_index_buffer ||
+            !state->fn.cmd_draw_indirect || !state->fn.cmd_draw_indexed_indirect ||
+            !state->fn.cmd_dispatch_indirect || !state->fn.cmd_draw_mesh_tasks ||
+            !state->fn.cmd_draw_mesh_tasks_indirect || !state->fn.cmd_copy_memory ||
+            !state->fn.cmd_copy_memory_to_image || !state->fn.cmd_copy_image_to_memory)
+        {
+            return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide the required Vulkan command entry points.");
+        }
     }
 
     if (presentation)
@@ -2024,20 +2197,27 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 
     state->caps = {
         .device_name = state->physical_properties.deviceName,
+        .tier = selected.tier,
         .queue_count = state->queue_count,
         .general_queue_count = queue_counts[0],
         .compute_queue_count = queue_counts[1],
         .copy_queue_count = queue_counts[2],
         .copy_texture_granularity = selected.copy_texture_granularity,
-        .max_push_data_size = state->heap_properties.maxPushDataSize,
+        .max_push_data_size = full_tier ? state->heap_properties.maxPushDataSize : selected.properties.limits.maxPushConstantsSize,
         .texture_heap_alignment = state->texture_heap_alignment,
         .timestamp_period_ns = selected.properties.limits.timestampPeriod,
         .sub_texel_precision_bits = selected.properties.limits.subTexelPrecisionBits,
         .texture_compression_bc = selected.texture_compression_bc,
         .texture_compression_astc = selected.texture_compression_astc,
         .storage_input_output16 = selected.storage_input_output16,
-        .indirect_mesh_draw = true,
+        .indirect_mesh_draw = full_tier,
     };
+    if (!full_tier)
+    {
+        error = compatible::create_descriptors(*state, desc);
+        if (error != Error::none)
+            return fail_device_creation(state, error);
+    }
     if (presentation)
     {
         state->swapchain = new Swapchain;
@@ -2045,6 +2225,12 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         state->swapchain->format = desc.swapchain_format;
         state->swapchain->color_space = desc.swapchain_color_space == ColorSpace::extended_srgb_linear
             ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        if (!state->present_fences)
+        {
+            error = compatible::create_image_semaphores(*state->swapchain);
+            if (error != Error::none)
+                return fail_device_creation(state, error);
+        }
         error = recreate_swapchain(*state->swapchain);
         if (error != Error::none)
             return fail_device_creation(state, error);
@@ -2136,6 +2322,7 @@ void destroy_gpu_heap(const GpuHeap& heap) noexcept
     assert(heap.owner->state);
     const VkDevice device = heap.owner->state->device;
     const detail::BackingBuffer& backing = heap.owner->backing;
+    if (heap.owner->state->caps.tier == DeviceTier::compatible) compatible::remove_heap_buffer(*heap.owner->state, backing.buffer);
     if (backing.mapped) vkUnmapMemory(device, backing.memory);
     vkDestroyBuffer(device, backing.buffer, nullptr);
     vkFreeMemory(device, backing.memory, nullptr);
@@ -2156,6 +2343,7 @@ void retire_swapchain_handle(Swapchain& swapchain) noexcept
         return;
     }
 
+    if (!device->present_fences) compatible::wait_for_presents(*device);
     device->poll_present_contexts();
     detail::RetiredSwapchain retired{
         .handle = swapchain.handle,
@@ -2212,6 +2400,7 @@ void destroy_owned_swapchain(Device& device) noexcept
     Swapchain* swapchain = device.swapchain;
     assert(!swapchain->acquired && device.acquired_swapchain != swapchain);
     retire_swapchain_handle(*swapchain);
+    if (!device.present_fences) compatible::destroy_image_semaphores(*swapchain);
     swapchain->state = nullptr;
     delete swapchain;
     device.swapchain = nullptr;
@@ -2254,13 +2443,15 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
 {
     Device& device = *swapchain.state;
     assert(!swapchain.acquired && !device.acquired_swapchain);
+    // The two present-mode structures come with the maintenance extensions, which a device without present fences may lack.
+    // The present mode never changes, so that device leaves them out.
     const VkSurfacePresentModeKHR present_mode_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
         .presentMode = swapchain_present_mode,
     };
     const VkPhysicalDeviceSurfaceInfo2KHR surface_info{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
-        .pNext = &present_mode_info,
+        .pNext = device.present_fences ? &present_mode_info : nullptr,
         .surface = device.surface,
     };
     VkSurfaceCapabilities2KHR capabilities_info{
@@ -2335,7 +2526,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     };
     const VkSwapchainCreateInfoKHR create_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .pNext = &present_modes_info,
+        .pNext = device.present_fences ? &present_modes_info : nullptr,
         .surface = device.surface,
         .minImageCount = requested_image_count,
         .imageFormat = requested_format,
@@ -2823,6 +3014,8 @@ void destroy_render_view(RenderView* render_view) noexcept
 TextureDescriptorHeap* create_texture_descriptor_heap(Device* device, uint32 capacity) noexcept
 {
     assert(device && capacity);
+    if (device->caps.tier == DeviceTier::compatible)
+        return compatible::create_texture_descriptor_heap(device, capacity);
     TextureDescriptorHeap* heap = new TextureDescriptorHeap{
         .state = device,
         .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.imageDescriptorSize, DescriptorHeapType::texture),
@@ -2839,6 +3032,8 @@ TextureDescriptorHeap* create_texture_descriptor_heap(Device* device, uint32 cap
 void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept
 {
     if (!heap) return;
+    if (heap->state->caps.tier == DeviceTier::compatible)
+        return compatible::destroy_texture_descriptor_heap(heap);
     destroy_gpu_heap(heap->storage);
     delete heap;
 }
@@ -2846,6 +3041,8 @@ void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept
 SamplerDescriptorHeap* create_sampler_descriptor_heap(Device* device, uint32 capacity) noexcept
 {
     assert(device && capacity);
+    if (device->caps.tier == DeviceTier::compatible)
+        return compatible::create_sampler_descriptor_heap(device, capacity);
     SamplerDescriptorHeap* heap = new SamplerDescriptorHeap{
         .state = device,
         .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.samplerDescriptorSize, DescriptorHeapType::sampler),
@@ -2862,6 +3059,8 @@ SamplerDescriptorHeap* create_sampler_descriptor_heap(Device* device, uint32 cap
 void destroy_sampler_descriptor_heap(SamplerDescriptorHeap* heap) noexcept
 {
     if (!heap) return;
+    if (heap->state->caps.tier == DeviceTier::compatible)
+        return compatible::destroy_sampler_descriptor_heap(heap);
     destroy_gpu_heap(heap->storage);
     delete heap;
 }
@@ -2870,6 +3069,7 @@ void copy_texture_descriptors(const TextureDescriptorHeap* source, uint32 source
                               uint32 destination_index, uint32 count) noexcept
 {
     assert(source && destination && source->state == destination->state);
+    assert(source->state->caps.tier == DeviceTier::full && "descriptor copies need the full tier");
     assert(source_index <= source->capacity && count <= source->capacity - source_index);
     assert(destination_index <= destination->capacity && count <= destination->capacity - destination_index);
     const uint64 stride = source->state->heap_properties.imageDescriptorSize;
@@ -2881,6 +3081,7 @@ void copy_sampler_descriptors(const SamplerDescriptorHeap* source, uint32 source
                               uint32 destination_index, uint32 count) noexcept
 {
     assert(source && destination && source->state == destination->state);
+    assert(source->state->caps.tier == DeviceTier::full && "descriptor copies need the full tier");
     assert(source_index <= source->capacity && count <= source->capacity - source_index);
     assert(destination_index <= destination->capacity && count <= destination->capacity - destination_index);
     const uint64 stride = source->state->heap_properties.samplerDescriptorSize;
@@ -2926,6 +3127,8 @@ void write_texture_descriptor(TextureDescriptorHeap* heap, uint32 index, const T
             .layerCount = desc.layer_count == 0 ? VK_REMAINING_ARRAY_LAYERS : desc.layer_count,
         },
     };
+    if (device->caps.tier == DeviceTier::compatible)
+        return compatible::write_texture_descriptor(heap, index, type, view_info);
     const VkImageDescriptorInfoEXT image_descriptor{
         .sType = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
         .pView = &view_info,
@@ -2963,6 +3166,8 @@ void write_sampler_descriptor(SamplerDescriptorHeap* heap, uint32 index, const S
         .compareOp = static_cast<VkCompareOp>(desc.compare),
         .maxLod = VK_LOD_CLAMP_NONE,
     };
+    if (device->caps.tier == DeviceTier::compatible)
+        return compatible::write_sampler_descriptor(heap, index, sampler_info);
     const VkHostAddressRangeEXT destination{
         .address = heap->storage.range.cpu + uint64(index) * device->heap_properties.samplerDescriptorSize,
         .size = static_cast<size_t>(device->heap_properties.samplerDescriptorSize),
@@ -3022,22 +3227,27 @@ PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const Sha
         {.sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, .pNext = &fragment_module_info,
          .mappingCount = 1, .pMappings = &root_mapping},
     };
+    // The full tier maps each stage's root to the push address. The compatible tier's pipelines have a layout instead.
+    const bool compatible = device->caps.tier == DeviceTier::compatible;
+    const void* task_chain = compatible ? static_cast<const void*>(&task_module_info) : &mappings[0];
+    const void* first_stage_chain = compatible ? static_cast<const void*>(&first_stage_module_info) : &mappings[1];
+    const void* fragment_chain = compatible ? static_cast<const void*>(&fragment_module_info) : &mappings[2];
     const VkPipelineShaderStageCreateInfo stages[]{
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &mappings[0],
+            .pNext = task_chain,
             .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
             .pName = task.entry_point,
         },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &mappings[1],
+            .pNext = first_stage_chain,
             .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
             .pName = first_stage.entry_point,
         },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &mappings[2],
+            .pNext = fragment_chain,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
             .pName = fragment.entry_point,
         },
@@ -3128,7 +3338,7 @@ PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const Sha
     };
     const VkGraphicsPipelineCreateInfo pso_info{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &flags_info,
+        .pNext = compatible ? static_cast<const void*>(&rendering_info) : &flags_info,
         .stageCount = 1u + (task.code.size ? 1u : 0u) + (fragment.code.size ? 1u : 0u),
         .pStages = stages + (task.code.size ? 0u : 1u),
         .pVertexInputState = mesh ? nullptr : &vertex_input,
@@ -3139,6 +3349,7 @@ PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const Sha
         .pDepthStencilState = &depth_stencil,
         .pColorBlendState = &color_blend,
         .pDynamicState = &dynamic_state,
+        .layout = device->compatible_descriptors.pipeline_layout, // none on the full tier
         .basePipelineIndex = -1,
     };
     PSO* result = new PSO{
@@ -3163,6 +3374,7 @@ PSO* create_graphics_pso(Device* device, const GraphicsPSODesc& desc) noexcept
 
 PSO* create_mesh_pso(Device* device, const MeshPSODesc& desc) noexcept
 {
+    assert(device->caps.tier == DeviceTier::full && "mesh shaders need the full tier");
     return create_raster_pso(device, desc.mesh, desc.fragment, desc.color_targets, desc.depth_format,
                              desc.stencil_format, desc.rasterization, true, desc.task);
 }
@@ -3183,9 +3395,11 @@ PSO* create_compute_pso(Device* device, const ShaderStage& compute) noexcept
         .mappingCount = 1,
         .pMappings = &root_mapping,
     };
+    // The full tier maps the root to the push address. The compatible tier's pipelines have a layout instead.
+    const bool compatible = device->caps.tier == DeviceTier::compatible;
     const VkPipelineShaderStageCreateInfo stage{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = &mapping,
+        .pNext = compatible ? static_cast<const void*>(&module_info) : &mapping,
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .pName = compute.entry_point,
     };
@@ -3195,8 +3409,9 @@ PSO* create_compute_pso(Device* device, const ShaderStage& compute) noexcept
     };
     const VkComputePipelineCreateInfo pso_info{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = &flags_info,
+        .pNext = compatible ? nullptr : &flags_info,
         .stage = stage,
+        .layout = device->compatible_descriptors.pipeline_layout, // none on the full tier
         .basePipelineIndex = -1,
     };
     PSO* result = new PSO{
@@ -3219,7 +3434,11 @@ void destroy_pso(PSO* pso) noexcept
 CommandPool* create_command_pool(Device* device, uint32 queue_index) noexcept
 {
     assert(device && queue_index < device->queue_count && "create_command_pool requires an available queue index");
-    CommandPool* pool = new CommandPool{.state = device, .timestamps = device->queues[queue_index].timestamps};
+    CommandPool* pool = new CommandPool{
+        .state = device,
+        .timestamps = device->queues[queue_index].timestamps,
+        .graphics = queue_index < device->caps.general_queue_count,
+    };
     const VkCommandPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
@@ -3287,7 +3506,11 @@ CommandBuffer* begin_commands(CommandPool* pool) noexcept
     }
     else
     {
-        commands = new CommandBuffer{.state = pool->state, .command_pool = pool->command_pool};
+        commands = new CommandBuffer{
+            .state = pool->state,
+            .command_pool = pool->command_pool,
+            .graphics = pool->graphics,
+        };
         const VkCommandBufferAllocateInfo allocate_info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = pool->command_pool,
@@ -3519,6 +3742,7 @@ void submit_and_present(Device* device, const SubmitDesc& desc) noexcept
     }
     assert(contains_swapchain && "presentation submission must include the acquired command buffer");
 #endif
+    if (!device->present_fences) return compatible::submit_and_present(*device, desc);
     detail::PresentContext& present_context = *swapchain->present_context;
     assert(!present_context.present_pending && !present_context.swapchain);
     assert_vk(vkResetFences(device->device, 1, &present_context.presented));
@@ -3666,6 +3890,8 @@ void emit_root_pointer(CommandBuffer* commands, const void* root) noexcept
 {
     if (!root) return;
     assert((reinterpret_cast<uintptr>(root) & 15u) == 0);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::push_root(commands, root);
     const VkPushDataInfoEXT info{
         .sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
         .data = {.address = &root, .size = sizeof(root)},
@@ -3677,6 +3903,8 @@ void emit_root_pointer(CommandBuffer* commands, const void* root) noexcept
 void set_texture_descriptor_heap(CommandBuffer* commands, TextureDescriptorHeap* heap) noexcept
 {
     assert(commands && heap && commands->state == heap->state);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::bind_descriptors(commands);
     const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties = commands->state->heap_properties;
     VkBindHeapInfoEXT bind_info{};
     make_heap_bind_info(
@@ -3692,6 +3920,8 @@ void set_texture_descriptor_heap(CommandBuffer* commands, TextureDescriptorHeap*
 void set_sampler_descriptor_heap(CommandBuffer* commands, SamplerDescriptorHeap* heap) noexcept
 {
     assert(commands && heap && commands->state == heap->state);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::bind_descriptors(commands);
     const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties = commands->state->heap_properties;
     VkBindHeapInfoEXT bind_info{};
     make_heap_bind_info(gpu_range(heap->storage), properties.samplerDescriptorAlignment, properties.minSamplerHeapReservedRange, bind_info);
@@ -3835,6 +4065,8 @@ void draw_indexed(CommandBuffer* commands, const void* root, GpuRange indices, I
 {
     assert(commands && commands->state);
     emit_root_pointer(commands, root);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::draw_indexed(commands, indices, type, index_count, instance_count, first_index, vertex_offset, first_instance);
     const VkBindIndexBuffer3InfoKHR bind_info{
         .sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
         .addressRange = {
@@ -3852,6 +4084,8 @@ void draw_indirect(CommandBuffer* commands, const void* root, GpuRange arguments
 {
     assert(commands && commands->state);
     emit_root_pointer(commands, root);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::draw_indirect(commands, arguments, draw_count, stride);
     const VkDrawIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3870,6 +4104,8 @@ void draw_indexed_indirect(CommandBuffer* commands, const void* root, GpuRange i
 {
     assert(commands && commands->state);
     emit_root_pointer(commands, root);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::draw_indexed_indirect(commands, indices, type, arguments, draw_count, stride);
     const VkBindIndexBuffer3InfoKHR bind_info{
         .sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
         .addressRange = {
@@ -3904,6 +4140,8 @@ void dispatch_indirect(CommandBuffer* commands, const void* root, GpuRange argum
 {
     assert(commands && commands->state);
     emit_root_pointer(commands, root);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::dispatch_indirect(commands, arguments);
     const VkDispatchIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DISPATCH_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3918,6 +4156,7 @@ void dispatch_indirect(CommandBuffer* commands, const void* root, GpuRange argum
 void draw_meshlets(CommandBuffer* commands, const void* root, uint32x3 group_count) noexcept
 {
     assert(commands && commands->state);
+    assert(commands->state->caps.tier == DeviceTier::full && "mesh shaders need the full tier");
     emit_root_pointer(commands, root);
     commands->state->fn.cmd_draw_mesh_tasks(commands->command_buffer, group_count.x, group_count.y, group_count.z);
 }
@@ -3943,6 +4182,8 @@ void draw_meshlets_indirect(CommandBuffer* commands, const void* root, GpuRange 
 void copy_memory(CommandBuffer* commands, GpuRange source, GpuRange destination) noexcept
 {
     assert(commands && commands->state);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::copy_memory(commands, source, destination);
     const VkDeviceMemoryCopyKHR region{
         .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
         .srcRange = {
@@ -3968,6 +4209,8 @@ void copy_memory_to_texture(CommandBuffer* commands, GpuRange source, Texture* d
 {
     assert(commands && commands->state && destination);
     const VkDeviceMemoryImageCopyKHR region = make_texture_copy_region(*destination, copy, source);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::copy_memory_to_texture(commands, source, destination, region);
     const VkCopyDeviceMemoryImageInfoKHR info{
         .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
         .image = destination->image,
@@ -3981,6 +4224,8 @@ void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange d
 {
     assert(commands && commands->state && source);
     const VkDeviceMemoryImageCopyKHR region = make_texture_copy_region(*source, copy, destination);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::copy_texture_to_memory(commands, source, destination, region);
     const VkCopyDeviceMemoryImageInfoKHR info{
         .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
         .image = source->image,
@@ -3993,7 +4238,18 @@ void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange d
 void barrier(CommandBuffer* commands, Stage before, Access before_access, Stage after, Access after_access) noexcept
 {
     assert(commands);
+    if (commands->state->caps.tier == DeviceTier::compatible)
+        return compatible::barrier(commands->command_buffer, before, before_access, after, after_access);
     record_barrier(commands->command_buffer, before, before_access, after, after_access);
+}
+
+HeapBufferStats get_heap_buffer_stats(const Device* device) noexcept
+{
+    assert(device);
+    return {
+        .in_use = device->heap_buffer_count,
+        .high_water = device->heap_buffer_high_water,
+    };
 }
 
 } // namespace gpu

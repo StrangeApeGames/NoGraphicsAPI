@@ -20,7 +20,8 @@ desktop platforms.
 
 Support is determined by extension enumeration and feature queries at startup. A Vulkan version
 alone is not enough; this table highlights the dependencies that shape the API rather than every
-conventional feature checked by device creation.
+conventional feature checked by device creation. It is the full tier's; older GPUs get the
+[compatible tier](#compatible-tier).
 
 | Requirement | Contribution to the model |
 |---|---|
@@ -44,6 +45,40 @@ Windowed devices also require `VK_KHR_get_surface_capabilities2`,
 original EXT variants are accepted as a paired fallback. Swapchain maintenance supplies a completion
 fence for each presentation.
 Debug builds enable `VK_EXT_debug_utils` and the Khronos validation layer when available.
+
+## Compatible tier
+
+`create_device` picks one of two tiers for the device and reports it in `DeviceCaps::tier`. A device
+with everything above gets the full tier. One without `VK_EXT_descriptor_heap`,
+`VK_KHR_device_address_commands`, `VK_KHR_shader_untyped_pointers` or `VK_EXT_mesh_shader`, such as a
+GTX 10, an RX 5000 or 6000, Polaris, Arc or Iris Xe, gets the compatible tier when it has Vulkan 1.3
+with `maintenance5`, descriptor indexing (runtime arrays, partially bound, update-after-bind sampled
+images, storage images and samplers, non-uniform sampled-image indexing), and the rest of the table
+above but `shaderFloat16` and `storagePushConstant16`. A device that fits neither fails with one
+message naming the GPU, its driver and what it lacks. `DeviceDesc::force_compatible_tier` picks the
+compatible tier on a full-tier device, to test it.
+
+The API and its model are the same; the Vulkan calls under them differ:
+
+| | Full tier | Compatible tier |
+|---|---|---|
+| Texture and sampler heaps | Descriptor heaps | One update-after-bind, partially bound descriptor set made with the device: binding 0 sampled images, 1 storage images, 2 samplers. Slot *i* is heap index *i*. `DeviceDesc::compatible_texture_descriptor_capacity` and `compatible_sampler_descriptor_capacity` size it |
+| Root | `vkCmdPushDataEXT` | An eight-byte push constant holding the root's address, in one pipeline layout every pipeline shares |
+| Index, indirect and copy commands | Address commands | Classic commands on the buffer that backs the address's GPU heap, found in a table of up to `max_heap_buffers` heaps |
+| Mesh shaders | Required | Absent: mesh PSOs and meshlet draws assert |
+| Upload staging | Device-local CPU-visible memory | `MemoryType::upload`, in system memory, so a GPU without Resizable BAR keeps its small BAR |
+
+Shaders compile a second SPIR-V for the compatible tier, with `-DNOGRAPHICSAPI_COMPATIBLE` and without
+`-capability spvDescriptorHeapEXT`. `shader.slang` then reads the root through the push constant, and
+`gpu_texture` and `gpu_sampler` index the set's arrays, which `shader_compatible.slang` declares once
+for every module of a shader. Pass the define before any `-r` module. Validate with
+`--target-env vulkan1.3`, and keep the `Float16` capability out for GPUs without `shaderFloat16`.
+
+On the compatible tier a device has one texture heap and one sampler heap, descriptor copies are not
+available, and GPU heaps are created and destroyed while no other thread records commands.
+Without swapchain_maintenance1, presentation uses no present fences: render-finished semaphores are per swapchain image,
+acquire semaphores are reused after their submit completes on the presentation timeline, and a recreate waits for queue
+zero to idle. `DeviceDesc::force_no_present_fences` tests it.
 
 ## GPU heaps and application-side allocation
 

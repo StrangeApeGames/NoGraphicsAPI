@@ -49,6 +49,17 @@ T gpu_sampler<T : IOpaqueDescriptor = SamplerState>(uint index)
     return gpu_sampler_value<T>(gpu_sampler_heap[index]);
 }
 
+#elif defined(NOGRAPHICSAPI_COMPATIBLE)
+
+// The push constant is the root's GPU address, and gpu_texture and gpu_sampler index the descriptor set's arrays.
+#define GPU_ROOT_DEFAULT(type, name) GPU_ROOT_IMPL(type, name, 4)
+#define GPU_ROOT_IMPL(type, name, alignment) \
+    [[vk::push_constant]] cbuffer name##_push_constants { type* name##_address; }; \
+    static type* name = name##_address
+#define GPU_ADDRESS(value) (&(value))
+
+import shader_compatible;
+
 #else
 
 #define GPU_ROOT_DEFAULT(type, name) GPU_ROOT_IMPL(type, name, 4)

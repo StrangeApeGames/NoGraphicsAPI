@@ -33,7 +33,9 @@ UploadQueue::UploadQueue(Device* device, uint64 capacity, uint32 queue_index, ui
     {
         state_.texture_granularity = caps.copy_texture_granularity;
     }
-    state_.heap = create_gpu_heap(device, capacity, MemoryType::cpu_visible);
+    // The compatible tier's GPUs may have a small fixed BAR and no Resizable BAR, and staging is only a copy source.
+    const MemoryType staging_memory = caps.tier == DeviceTier::compatible ? MemoryType::upload : MemoryType::cpu_visible;
+    state_.heap = create_gpu_heap(device, capacity, staging_memory);
     if (!state_.heap.owner) { destroy(); return; }
     state_.completion.semaphore = create_timeline_semaphore(device);
     if (!state_.completion.semaphore) { destroy(); return; }
