@@ -701,6 +701,7 @@ struct Device
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_messenger = nullptr;
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE; // every pipeline is made through it; see DeviceDesc::pipeline_cache_data
     detail::Queue* queues = nullptr;
     uint32 queue_count = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -1111,6 +1112,7 @@ Device::~Device()
     {
         destroy_present_context(present_contexts[index]);
     }
+    if (pipeline_cache) vkDestroyPipelineCache(device, pipeline_cache, nullptr);
     if (device) vkDestroyDevice(device, nullptr);
     if (instance && surface) vkDestroySurfaceKHR(instance, surface, nullptr);
     if (instance && debug_messenger && destroy_debug_messenger) destroy_debug_messenger(instance, debug_messenger, nullptr);
@@ -2144,6 +2146,16 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     }
     if (!supports_gpu_heap_memory(*state, selected.tier) || !select_texture_memory_type(*state))
         return fail_device_creation(state, Error::unsupported);
+
+    // Data the driver does not recognize (another driver's, or damaged) is ignored, and the cache starts empty.
+    const VkPipelineCacheCreateInfo pipeline_cache_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .initialDataSize = desc.pipeline_cache_data.size,
+        .pInitialData = desc.pipeline_cache_data.data,
+    };
+    error = error_from_vk(vkCreatePipelineCache(state->device, &pipeline_cache_info, nullptr, &state->pipeline_cache), "vkCreatePipelineCache");
+    if (error != Error::none)
+        return fail_device_creation(state, error);
 
     // The compatible tier calls the core commands these replace.
     if (full_tier)
@@ -3356,7 +3368,7 @@ PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const Sha
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
     };
-    if (error_from_vk(vkCreateGraphicsPipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateGraphicsPipelines") != Error::none)
+    if (error_from_vk(vkCreateGraphicsPipelines(device->device, device->pipeline_cache, 1, &pso_info, nullptr, &result->pso), "vkCreateGraphicsPipelines") != Error::none)
     {
         delete result;
         return nullptr;
@@ -3418,7 +3430,7 @@ PSO* create_compute_pso(Device* device, const ShaderStage& compute) noexcept
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_COMPUTE,
     };
-    if (error_from_vk(vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateComputePipelines") != Error::none)
+    if (error_from_vk(vkCreateComputePipelines(device->device, device->pipeline_cache, 1, &pso_info, nullptr, &result->pso), "vkCreateComputePipelines") != Error::none)
     {
         delete result;
         return nullptr;
@@ -3793,6 +3805,16 @@ const DeviceCaps& get_device_caps(const Device* device) noexcept
 {
     assert(device && "get_device_caps called with a null device");
     return device->caps;
+}
+
+uint64 get_pipeline_cache_data(Device* device, Span<uint8> buffer) noexcept
+{
+    assert(device && "get_pipeline_cache_data called with a null device");
+    size_t byte_count = buffer.size;
+    uint8* data = buffer.size > 0 ? buffer.data : nullptr;
+    const VkResult result = vkGetPipelineCacheData(device->device, device->pipeline_cache, &byte_count, data);
+    const bool succeeded = result == VK_SUCCESS || (result == VK_INCOMPLETE && buffer.size == 0);
+    return succeeded ? byte_count : 0;
 }
 
 bool supports_texture_format(const Device* device, Format format, TextureUsage usage) noexcept

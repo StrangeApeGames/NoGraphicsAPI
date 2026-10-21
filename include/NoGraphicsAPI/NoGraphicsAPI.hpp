@@ -488,6 +488,9 @@ struct DeviceDesc
     // Vulkan compatible tier: the slots of the device's one descriptor set, which its texture and sampler descriptor heaps share.
     uint32 compatible_texture_descriptor_capacity = 65536;
     uint32 compatible_sampler_descriptor_capacity = 256;
+    // Vulkan: what get_pipeline_cache_data gave at the end of an earlier run, so that the pipelines it made are made again
+    // without compiling. The driver ignores data from another driver or GPU. Empty starts with an empty cache.
+    ByteSpan pipeline_cache_data = {};
 };
 
 struct DeviceInit
@@ -716,6 +719,9 @@ constexpr RenderingFlags operator|(RenderingFlags lhs, RenderingFlags rhs) noexc
 [[nodiscard]] DeviceInit create_device(const DeviceDesc& desc = {}) noexcept;
 void destroy_device(Device* device) noexcept;
 [[nodiscard]] const DeviceCaps& get_device_caps(const Device* device) noexcept;
+// Vulkan: the device's pipeline cache, every pipeline made so far included, for the next run's DeviceDesc::pipeline_cache_data.
+// Asks the driver for its size with an empty buffer, then fills a buffer of that size: the bytes written, 0 on failure.
+[[nodiscard]] uint64 get_pipeline_cache_data(Device* device, Span<uint8> buffer) noexcept;
 [[nodiscard]] bool supports_texture_format(const Device* device, Format format, TextureUsage usage) noexcept;
 [[nodiscard]] uint32x2 get_drawable_extent(Device* device) noexcept;
 // Call after wait_idle, outside an acquired frame. Unsupported pairs leave the current mode unchanged.
