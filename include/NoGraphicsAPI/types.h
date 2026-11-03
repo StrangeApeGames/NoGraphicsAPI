@@ -16,13 +16,8 @@ typedef short int16;
 typedef unsigned short uint16;
 typedef int int32;
 typedef unsigned int uint32;
-#if defined(_MSC_VER)
 typedef long long int64;
 typedef unsigned long long uint64;
-#else
-typedef __INT64_TYPE__ int64;
-typedef __UINT64_TYPE__ uint64;
-#endif
 typedef unsigned char byte;
 typedef uint64 uintptr;
 

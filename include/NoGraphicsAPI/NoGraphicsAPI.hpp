@@ -464,12 +464,19 @@ struct DeviceCaps
 
 enum class ColorSpace : uint32 { srgb, extended_srgb_linear };
 
+// The window system DeviceDesc::window belongs to. native is the platform's own: Win32 on Windows, Metal on Apple's.
+enum class WindowSystem : uint32 { native, wayland, xlib };
+
 // Win32 windowed device lifecycle, swapchain format/extent changes, acquire, and presentation stay on the window's message-pump thread.
 // Metal calls may use a render thread; synchronize CAMetalLayer access with native UI/layer changes.
 // The window/layer must outlive the device. Other calls follow the object-level threading contract below.
 struct DeviceDesc
 {
-    void* window = nullptr; // HWND on Windows; CAMetalLayer* on macOS/iOS. Null creates a headless device.
+    void* window = nullptr; // HWND on Windows; CAMetalLayer* on macOS/iOS; wl_surface* or an Xlib Window on Linux. Null creates a headless device.
+    void* display = nullptr; // Linux: the connection the window is on, wl_display* or Xlib's Display*.
+    WindowSystem window_system = WindowSystem::native;
+    // The window's size in pixels, which a surface with no size of its own (Wayland's) takes: see set_window_extent.
+    uint32x2 window_extent = {};
     Format swapchain_format = Format::undefined;
     ColorSpace swapchain_color_space = ColorSpace::srgb;
     uint32 desired_swapchain_image_count = 2; // Vulkan: 1..8 presentation contexts. Metal clamps to 2..3 drawables.
@@ -724,6 +731,9 @@ void destroy_device(Device* device) noexcept;
 [[nodiscard]] uint64 get_pipeline_cache_data(Device* device, Span<uint8> buffer) noexcept;
 [[nodiscard]] bool supports_texture_format(const Device* device, Format format, TextureUsage usage) noexcept;
 [[nodiscard]] uint32x2 get_drawable_extent(Device* device) noexcept;
+// The window's size in pixels, after it changes. A surface that has a size of its own (Win32's, X11's) keeps to it, and
+// this is ignored; one that has none (Wayland's) takes this, and its swapchain is made again at the next acquire.
+void set_window_extent(Device* device, uint32x2 extent) noexcept;
 // Call after wait_idle, outside an acquired frame. Unsupported pairs leave the current mode unchanged.
 // A zero-size drawable defers swapchain recreation until acquire sees a nonzero extent.
 [[nodiscard]] Error set_swapchain_format(Device* device, Format format, ColorSpace color_space) noexcept;
