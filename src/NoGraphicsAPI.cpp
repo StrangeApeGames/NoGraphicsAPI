@@ -53,9 +53,9 @@ constexpr uint32 max_queue_families = 64;
 constexpr uint32 queue_type_count = 3; // General, compute-only, copy-only.
 constexpr uint32 max_color_attachments = 8;
 constexpr uint32 max_swapchain_images = 8;
-constexpr VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 constexpr uint32 gpu_allocation_alignment = 16;
 constexpr uint32 max_surface_formats = 64;
+constexpr uint32 max_present_modes = 16; // Vulkan names eight, and extensions a few more
 constexpr uint32 format_count = static_cast<uint32>(Format::undefined);
 
 enum class DescriptorHeapType : uint8
@@ -718,6 +718,7 @@ struct Device
     uint32 queue_count = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     uint32x2 window_extent = {}; // what a surface with no size of its own takes: set_window_extent
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR; // FIFO waits for the display's refresh; IMMEDIATE: set_vsync
     uint32 queue_families[queue_type_count]{};
     uint32 queue_family_count = 0;
     uint32 timestamp_query_count = 0;
@@ -2503,10 +2504,10 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     Device& device = *swapchain.state;
     assert(!swapchain.acquired && !device.acquired_swapchain);
     // The two present-mode structures come with the maintenance extensions, which a device without present fences may lack.
-    // The present mode never changes, so that device leaves them out.
+    // They name the one mode the swapchain is made with, so that device leaves them out: set_vsync makes it again.
     const VkSurfacePresentModeKHR present_mode_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
-        .presentMode = swapchain_present_mode,
+        .presentMode = device.present_mode,
     };
     const VkPhysicalDeviceSurfaceInfo2KHR surface_info{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
@@ -2579,7 +2580,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     const VkSwapchainPresentModesCreateInfoKHR present_modes_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
         .presentModeCount = 1,
-        .pPresentModes = &swapchain_present_mode,
+        .pPresentModes = &device.present_mode,
     };
     const VkSwapchainCreateInfoKHR create_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -2596,7 +2597,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .pQueueFamilyIndices = device.queue_families,
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = composite_alpha,
-        .presentMode = swapchain_present_mode,
+        .presentMode = device.present_mode,
         .clipped = VK_TRUE,
         .oldSwapchain = old_handle,
     };
@@ -2710,6 +2711,32 @@ void set_window_extent(Device* device, uint32x2 extent) noexcept
     bool changed = device->window_extent.x != extent.x || device->window_extent.y != extent.y;
     device->window_extent = extent;
     if (changed && device->swapchain) device->swapchain->recreate_required = true;
+}
+
+Error set_vsync(Device* device, bool waits_for_refresh) noexcept
+{
+    assert(device && "set_vsync called with a null device");
+    VkPresentModeKHR present_mode = waits_for_refresh ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (device->present_mode == present_mode)
+        return Error::none;
+    // FIFO is every surface's. IMMEDIATE is every desktop driver's on Windows, and not every Wayland compositor's.
+    if (!waits_for_refresh && device->surface)
+    {
+        VkPresentModeKHR modes[max_present_modes]{};
+        uint32 mode_count = max_present_modes;
+        const Error error = error_from_vk(vkGetPhysicalDeviceSurfacePresentModesKHR(device->physical_device, device->surface, &mode_count, modes),
+            "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        if (error != Error::none)
+            return error;
+        bool is_supported = false;
+        for (uint32 index = 0; index < mode_count; ++index)
+            is_supported = is_supported || modes[index] == present_mode;
+        if (!is_supported)
+            return Error::unsupported;
+    }
+    device->present_mode = present_mode;
+    if (device->swapchain) device->swapchain->recreate_required = true;
+    return Error::none;
 }
 
 uint32x2 get_drawable_extent(Device* device) noexcept

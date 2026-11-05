@@ -734,6 +734,11 @@ void destroy_device(Device* device) noexcept;
 // The window's size in pixels, after it changes. A surface that has a size of its own (Win32's, X11's) keeps to it, and
 // this is ignored; one that has none (Wayland's) takes this, and its swapchain is made again at the next acquire.
 void set_window_extent(Device* device, uint32x2 extent) noexcept;
+// Whether presenting waits for the display's refresh, as a device starts (FIFO), or shows each frame as soon as it is
+// drawn (IMMEDIATE), which can tear. The swapchain is made again at the next acquire. A surface that cannot present
+// IMMEDIATE leaves the mode unchanged and gives Error::unsupported. Vulkan only for now: the Metal backend has neither this
+// nor set_window_extent yet.
+[[nodiscard]] Error set_vsync(Device* device, bool waits_for_refresh) noexcept;
 // Call after wait_idle, outside an acquired frame. Unsupported pairs leave the current mode unchanged.
 // A zero-size drawable defers swapchain recreation until acquire sees a nonzero extent.
 [[nodiscard]] Error set_swapchain_format(Device* device, Format format, ColorSpace color_space) noexcept;
